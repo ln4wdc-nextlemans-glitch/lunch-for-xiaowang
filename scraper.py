@@ -53,14 +53,9 @@ if table:
 
         # 收集当天所有菜品
         for dish in dishes:
-            scraped_rows.append({
-                "date": formatted_date,
-                "day_of_week": weekday,
-                "dish": dish,
-                "ingredients": dish
-            })
+            scraped_rows.append([formatted_date, weekday, dish, dish])
 
-# 2. 连接 Google Sheets 并写入
+# 2. 连接 Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
 creds_dict = json.loads(creds_json)
@@ -70,31 +65,21 @@ client = gspread.authorize(creds)
 spreadsheet_id = os.environ.get("SPREADSHEET_ID")
 sheet = client.open_by_key(spreadsheet_id)
 
-# --- 写入 Sheet 1：每天的食物 ---
+# --- 写入 Sheet 1：每天的食物（使用批量清空与覆盖，避免重复和频率超限） ---
 try:
     sheet1 = sheet.worksheet("每天的食物")
 except gspread.exceptions.WorksheetNotFound:
     sheet1 = sheet.add_worksheet(title="每天的食物", rows="1000", cols="10")
-    sheet1.append_row(["date", "day_of_week", "dish", "ingredients"])
 
-# 检查 Sheet1 是否为空，如果第一行为空或没有表头，先写表头
-existing_values = sheet1.get_all_values()
-if not existing_values:
-    sheet1.append_row(["date", "day_of_week", "dish", "ingredients"])
-
-# 为了避免每次运行都重复追加相同的数据，可以先清空 Sheet1 或者做去重
-# 这里我们选择每次覆盖写入最新抓取的数据（保持 Sheet1 始终是最新一周的数据，或者累加）
-# 如果你想累加，保留下面这行：
-for item in scraped_rows:
-    sheet1.append_row([item["date"], item["day_of_week"], item["dish"], item["ingredients"]])
+sheet1.clear()
+# 批量写入：表头 + 所有抓取的数据
+sheet1.append_rows([["date", "day_of_week", "dish", "ingredients"]] + scraped_rows)
 
 # --- 读取并更新统计 Sheet 2 和 Sheet 3 ---
 data = sheet1.get_all_records()
 df = pd.DataFrame(data)
 
-# 兼容可能存在的中文表头或空白行
 if not df.empty:
-    # 如果列名里包含“日期”，将其重命名为 “date” 以防万一
     df = df.rename(columns={"日期": "date", "菜品名称": "dish", "食材": "ingredients"})
     
     if 'date' in df.columns and 'dish' in df.columns:
@@ -108,9 +93,8 @@ if not df.empty:
             sheet2 = sheet.add_worksheet(title="菜品出现次数统计", rows="100", cols="5")
         
         sheet2.clear()
-        sheet2.append_row(["菜品名称", "出现次数"])
-        for _, row in dish_counts.iterrows():
-            sheet2.append_row([row['菜品名称'], int(row['出现次数'])])
+        sheet2_data = [["菜品名称", "出现次数"]] + [[row['菜品名称'], int(row['出现次数'])] for _, row in dish_counts.iterrows()]
+        sheet2.append_rows(sheet2_data)
 
         # Sheet 3：按月分为周期，统计每种食材出现的频率
         df['月份'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
@@ -124,8 +108,7 @@ if not df.empty:
             sheet3 = sheet.add_worksheet(title="按月食材频率统计", rows="500", cols="5")
             
         sheet3.clear()
-        sheet3.append_row(["月份", "食材", "出现频率"])
-        for _, row in ing_freq.iterrows():
-            sheet3.append_row([row['月份'], row['食材'], int(row['出现频率'])])
+        sheet3_data = [["月份", "食材", "出现频率"]] + [[row['月份'], row['食材'], int(row['出现频率'])] for _, row in ing_freq.iterrows()]
+        sheet3.append_rows(sheet3_data)
 
-print("菜单数据爬取与 Google Sheets 更新成功！")
+print("菜单数据批量更新成功！")
