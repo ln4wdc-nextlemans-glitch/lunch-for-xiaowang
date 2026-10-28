@@ -21,6 +21,57 @@ current_year = year_match.group(1) if year_match else str(datetime.now().year)
 
 scraped_rows = []
 
+# 定义智能提取食材的函数（结合关键词映射与常见烹饪后缀清洗）
+def extract_ingredients(dish_name):
+    keyword_map = {
+        '豚肉': '豚肉',
+        'キャベツ': 'キャベツ',
+        'えび': 'えび',
+        '海老': 'えび',
+        '白身': '白身魚',
+        '鮭': '鮭',
+        '鶏': '鶏肉',
+        'チキン': '鶏肉',
+        'こんにゃく': 'こんにゃく',
+        'しいたけ': 'しいたけ',
+        '大根': '大根',
+        'さつまいも': 'さつまいも',
+        'ほうれん草': 'ほうれん草',
+        '小松菜': '小松菜',
+        '茄子': '茄子',
+        '豆腐': '豆腐',
+        '白菜': '白菜',
+        '春雨': '春雨',
+        'グリンピース': 'グリンピース',
+        '玉子': '卵',
+        '卵': '卵',
+        'スパゲティー': 'パスタ・麺類',
+        'ペンネ': 'パスタ・麺類',
+    }
+    
+    found_ingredients = set()
+    
+    # 优先匹配核心关键词库
+    for keyword, ingredient in keyword_map.items():
+        if keyword in dish_name:
+            found_ingredients.add(ingredient)
+            
+    # 如果没直接命中，尝试剥离常见烹饪后缀和修饰词
+    if not found_ingredients:
+        cleaned = dish_name
+        suffixes = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ', 
+                    'のナムル', 'の胡麻和え', 'の金平風', 'フライ', 'てんぷら', '天ぷら', 
+                    '炒め', '焼き', '和え', 'ナムル', '風煮', '素揚げ', 'プレミアム']
+        for suffix in suffixes:
+            cleaned = cleaned.replace(suffix, '')
+        cleaned = cleaned.strip()
+        if cleaned:
+            found_ingredients.add(cleaned)
+        else:
+            found_ingredients.add(dish_name)
+            
+    return list(found_ingredients)
+
 # 遍历表格中的每一天
 table = soup.find('table', class_='week_menu_table')
 if table:
@@ -31,7 +82,6 @@ if table:
         if not th or not td:
             continue
             
-        # 提取日期和星期，例如 "10月26日（月）"
         date_str_raw = th.text.strip()
         date_match = re.search(r'(\d+)月(\d+)日[（\(]([月火水木金土日])[）\)]', date_str_raw)
         
@@ -42,7 +92,6 @@ if table:
             formatted_date = date_str_raw
             weekday = ""
 
-        # 详细菜品列表（按 <br> 拆分）
         txt_elem = td.find('div', class_='txt_week_menu')
         dishes = []
         if txt_elem:
@@ -51,9 +100,10 @@ if table:
                 if cleaned_line:
                     dishes.append(cleaned_line)
 
-        # 收集当天所有菜品
         for dish in dishes:
-            scraped_rows.append([formatted_date, weekday, dish, dish])
+            ingredients = extract_ingredients(dish)
+            for ing in ingredients:
+                scraped_rows.append([formatted_date, weekday, dish, ing])
 
 # 2. 连接 Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -65,26 +115,45 @@ client = gspread.authorize(creds)
 spreadsheet_id = os.environ.get("SPREADSHEET_ID")
 sheet = client.open_by_key(spreadsheet_id)
 
-# --- 写入 Sheet 1：每天的食物（使用批量清空与覆盖，避免重复和频率超限） ---
+# --- 写入 Sheet 1：每天的食物（增量追加 + 智能去重，保留全部历史数据） ---
 try:
     sheet1 = sheet.worksheet("每天的食物")
 except gspread.exceptions.WorksheetNotFound:
     sheet1 = sheet.add_worksheet(title="每天的食物", rows="1000", cols="10")
+    sheet1.append_row(["date", "day_of_week", "dish", "ingredient"])
 
-sheet1.clear()
-# 批量写入：表头 + 所有抓取的数据
-sheet1.append_rows([["date", "day_of_week", "dish", "ingredients"]] + scraped_rows)
+# 获取已有数据用于去重比对
+existing_data = sheet1.get_all_values()
+existing_set = set()
+if len(existing_data) > 1:
+    for row in existing_data[1:]:
+        if len(row) >= 4:
+            existing_set.add((row[0], row[2], row[3])) # (date, dish, ingredient)
 
-# --- 读取并更新统计 Sheet 2 和 Sheet 3 ---
-data = sheet1.get_all_records()
-df = pd.DataFrame(data)
+# 过滤出表格中尚不存在的新数据
+new_rows = []
+for row in scraped_rows:
+    row_key = (row[0], row[2], row[3])
+    if row_key not in existing_set:
+        new_rows.append(row)
+
+if new_rows:
+    sheet1.append_rows(new_rows)
+    print(f"成功追加了 {len(new_rows)} 条新数据到 Sheet 1")
+else:
+    print("没有发现需要补充的新数据（已存在）")
+
+# --- 读取 Sheet 1 的全部历史数据，全量更新统计 Sheet 2 和 Sheet 3 ---
+all_data = sheet1.get_all_records()
+df = pd.DataFrame(all_data)
 
 if not df.empty:
-    df = df.rename(columns={"日期": "date", "菜品名称": "dish", "食材": "ingredients"})
+    df = df.rename(columns={"日期": "date", "菜品名称": "dish", "食材": "ingredient", "ingredients": "ingredient"})
     
     if 'date' in df.columns and 'dish' in df.columns:
-        # Sheet 2：统计每种菜品出现的次数
-        dish_counts = df['dish'].value_counts().reset_index()
+        # Sheet 2：基于全部历史数据统计每种菜品出现的总次数
+        df_dish_unique = df[['date', 'dish']].drop_duplicates()
+        dish_counts = df_dish_unique['dish'].value_counts().reset_index()
         dish_counts.columns = ['菜品名称', '出现次数']
         
         try:
@@ -96,10 +165,9 @@ if not df.empty:
         sheet2_data = [["菜品名称", "出现次数"]] + [[row['菜品名称'], int(row['出现次数'])] for _, row in dish_counts.iterrows()]
         sheet2.append_rows(sheet2_data)
 
-        # Sheet 3：按月分为周期，统计每种食材出现的频率
+        # Sheet 3：按月分为周期，基于全部历史数据统计每种食材出现的频率
         df['月份'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
-        ing_col = 'ingredients' if 'ingredients' in df.columns else 'dish'
-        ing_freq = df.groupby(['月份', ing_col]).size().reset_index(name='出现频率')
+        ing_freq = df.groupby(['月份', 'ingredient']).size().reset_index(name='出现频率')
         ing_freq.columns = ['月份', '食材', '出现频率']
         
         try:
@@ -111,4 +179,4 @@ if not df.empty:
         sheet3_data = [["月份", "食材", "出现频率"]] + [[row['月份'], row['食材'], int(row['出现频率'])] for _, row in ing_freq.iterrows()]
         sheet3.append_rows(sheet3_data)
 
-print("菜单数据批量更新成功！")
+print("历史数据累加与全量统计更新完成！")
