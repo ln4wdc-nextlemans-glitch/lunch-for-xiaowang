@@ -2,7 +2,7 @@ name: Weekly Menu Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * 1' # 每周一 UTC 时间 0:00 运行（对应日本时间周一早上 9:00）
+    - cron: '0 0 * * 1,4' # 每周一 UTC 时间 0:00 运行（对应日本时间周一早上 9:00）
   workflow_dispatch: # 允许你在 GitHub 网页端手动点按钮立即触发运行
 
 jobs:
