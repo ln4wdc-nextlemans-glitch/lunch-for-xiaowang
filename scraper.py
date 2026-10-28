@@ -21,7 +21,7 @@ current_year = year_match.group(1) if year_match else str(datetime.now().year)
 
 scraped_rows = []
 
-# 定义智能提取食材的函数（结合关键词映射与常见烹饪后缀清洗）
+# 定义严格的食材提取函数（只提取纯食材，过滤掉完整菜名）
 def extract_ingredients(dish_name):
     keyword_map = {
         '豚肉': '豚肉',
@@ -45,30 +45,21 @@ def extract_ingredients(dish_name):
         'グリンピース': 'グリンピース',
         '玉子': '卵',
         '卵': '卵',
+        'たこ': 'たこ',
+        'ツナ': 'ツナ',
+        'ウインナー': 'ウインナー',
+        'ベーコン': 'ベーコン',
         'スパゲティー': 'パスタ・麺類',
         'ペンネ': 'パスタ・麺類',
+        'うどん': 'パスタ・麺類',
     }
     
     found_ingredients = set()
     
-    # 优先匹配核心关键词库
+    # 只通过精准的食材字典进行匹配，确保绝不把整道菜名当成食材
     for keyword, ingredient in keyword_map.items():
         if keyword in dish_name:
             found_ingredients.add(ingredient)
-            
-    # 如果没直接命中，尝试剥离常见烹饪后缀和修饰词
-    if not found_ingredients:
-        cleaned = dish_name
-        suffixes = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ', 
-                    'のナムル', 'の胡麻和え', 'の金平風', 'フライ', 'てんぷら', '天ぷら', 
-                    '炒め', '焼き', '和え', 'ナムル', '風煮', '素揚げ', 'プレミアム']
-        for suffix in suffixes:
-            cleaned = cleaned.replace(suffix, '')
-        cleaned = cleaned.strip()
-        if cleaned:
-            found_ingredients.add(cleaned)
-        else:
-            found_ingredients.add(dish_name)
             
     return list(found_ingredients)
 
@@ -102,6 +93,10 @@ if table:
 
         for dish in dishes:
             ingredients = extract_ingredients(dish)
+            # 如果某道菜没有匹配到已知食材，为了保证 Sheet 1 明细完整，可以保留原菜名或记录为空，这里按需处理
+            if not ingredients:
+                ingredients = [dish] # 或者填 "其他"
+                
             for ing in ingredients:
                 scraped_rows.append([formatted_date, weekday, dish, ing])
 
@@ -122,15 +117,13 @@ except gspread.exceptions.WorksheetNotFound:
     sheet1 = sheet.add_worksheet(title="每天的食物", rows="1000", cols="10")
     sheet1.append_row(["date", "day_of_week", "dish", "ingredient"])
 
-# 获取已有数据用于去重比对
 existing_data = sheet1.get_all_values()
 existing_set = set()
 if len(existing_data) > 1:
     for row in existing_data[1:]:
         if len(row) >= 4:
-            existing_set.add((row[0], row[2], row[3])) # (date, dish, ingredient)
+            existing_set.add((row[0], row[2], row[3]))
 
-# 过滤出表格中尚不存在的新数据
 new_rows = []
 for row in scraped_rows:
     row_key = (row[0], row[2], row[3])
