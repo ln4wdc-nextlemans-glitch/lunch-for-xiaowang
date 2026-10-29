@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -8,107 +9,132 @@ import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
 
-# 1. 网页抓取与解析（加入 User-Agent 伪装和 15 秒超时控制）
+# ========== 1. 网页抓取（带 UA、超时、重试） ==========
 url = "https://tohan-corp.com/week-menu/"
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "ja,en;q=0.8",
 }
 
-try:
-    response = requests.get(url, headers=headers, timeout=15)
-    response.encoding = 'utf-8'
-except requests.exceptions.RequestException as e:
-    print(f"网页请求失败，可能是服务器超时或屏蔽了 IP: {e}")
-    raise e
+response = None
+for attempt in range(3):
+    try:
+        response = requests.get(url, headers=headers, timeout=(10, 30))
+        response.raise_for_status()
+        break
+    except requests.exceptions.RequestException as e:
+        print(f"第{attempt + 1}次请求失败: {e}")
+        response = None
+        time.sleep(5 * (attempt + 1))
 
+if response is None:
+    raise SystemExit("无法访问 tohan-corp.com，本次跳过（未修改任何表格数据）")
+
+response.encoding = 'utf-8'
 soup = BeautifulSoup(response.text, 'html.parser')
 
-# 获取年份（从副标题提取，如 "2026年"）
+# 年份（从副标题提取，如 "2026年"）
 sub_ttl_elem = soup.find('div', class_='topsub_week_menu_ttl')
 year_match = re.search(r'(\d{4})年', sub_ttl_elem.text) if sub_ttl_elem else None
 current_year = year_match.group(1) if year_match else str(datetime.now().year)
 
-scraped_rows = []
+# ========== 2. 食材提取 ==========
+SPECIAL_MAP = {
+    'カレーコロッケ': ['じゃがいも', 'カレー'],
+    '親子丼風煮': ['鶏肉', '卵'],
+    '肉団子の素揚げ': ['豚肉'],
+}
 
-# 定义更精准的食材提取与拆解函数
+SUFFIXES = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ',
+            'のナムル', 'の胡麻和え', 'の金平風', '風煮', '素揚げ', 'プレミアム',
+            'サラダ', '煮付', '風味']
+
+KEYWORD_MAP = {
+    '豚肉': '豚肉',
+    'キャベツ': 'キャベツ',
+    'えび': 'えび',
+    '海老': 'えび',
+    '白身': '白身魚',
+    '鮭': '鮭',
+    '鶏': '鶏肉',
+    'チキン': '鶏肉',
+    'こんにゃく': 'こんにゃく',
+    'しいたけ': 'しいたけ',
+    '大根': '大根',
+    'さつまいも': 'さつまいも',
+    'ほうれん草': 'ほうれん草',
+    '小松菜': '小松菜',
+    '茄子': '茄子',
+    '豆腐': '豆腐',
+    '白菜': '白菜',
+    '春雨': '春雨',
+    'グリンピース': 'グリンピース',
+    '玉子': '卵',
+    '卵': '卵',
+    'たこ': 'たこ',
+    'ツナ': 'ツナ',
+    'レンコン': 'レンコン',
+    'ポテト': 'じゃがいも',
+    'チンゲン菜': 'チンゲン菜',
+    'さつま揚げ': 'さつま揚げ',
+    'ウインナー': 'ウインナー',
+    'ベーコン': 'ベーコン',
+    'スパゲティー': 'パスタ・麺類',
+    'ペンネ': 'パスタ・麺類',
+    'うどん': 'パスタ・麺類',
+}
+
+OTHER = '其他'
+unmatched_log = set()   # 记录没匹配到的菜名片段，方便补 mapping
+
+
 def extract_ingredients(dish_name):
-    special_map = {
-        'カレーコロッケ': ['じゃがいも', 'カレー'],
-        '親子丼風煮': ['鶏肉', '卵'],
-        '肉団子の素揚げ': ['豚肉'],
-    }
-    for key, ings in special_map.items():
+    # 1. 特殊菜名直接指定
+    for key, ings in SPECIAL_MAP.items():
         if key in dish_name:
             return ings
 
-    cleaned_name = dish_name
-    suffixes = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ', 
-                'のナムル', 'の胡麻和え', 'の金平風', '風煮', '素揚げ', 'プレミアム', 'サラダ', '煮付', '風味']
-    for s in suffixes:
-        cleaned_name = cleaned_name.replace(s, '')
-    
-    parts = re.split(r'[と＆]', cleaned_name)
-    found_ingredients = set()
-    
-    keyword_map = {
-        '豚肉': '豚肉',
-        'キャベツ': 'キャベツ',
-        'えび': 'えび',
-        '海老': 'えび',
-        '白身': '白身魚',
-        '鮭': '鮭',
-        '鶏': '鶏肉',
-        'チキン': '鶏肉',
-        'こんにゃく': 'こんにゃく',
-        'しいたけ': 'しいたけ',
-        '大根': '大根',
-        'さつまいも': 'さつまいも',
-        'ほうれん草': 'ほうれん草',
-        '小松菜': '小松菜',
-        '茄子': '茄子',
-        '豆腐': '豆腐',
-        '白菜': '白菜',
-        '春雨': '春雨',
-        'グリンピース': 'グリンピース',
-        '玉子': '卵',
-        '卵': '卵',
-        'たこ': 'たこ',
-        'ツナ': 'ツナ',
-        'レンコン': 'レンコン',
-        'ポテト': 'じゃがいも',
-        'チンゲン菜': 'チンゲン菜',
-        'さつま揚げ': 'さつま揚げ',
-    }
+    # 2. 去掉烹饪修饰词
+    cleaned = dish_name
+    for s in SUFFIXES:
+        cleaned = cleaned.replace(s, '')
 
+    # 3. 按 "と" "＆" 拆分多食材
+    parts = re.split(r'[と＆&]', cleaned)
+
+    found = []
     for part in parts:
         part = part.strip()
+        if not part:
+            continue
         matched = False
-        for keyword, ingredient in keyword_map.items():
+        for keyword, ingredient in KEYWORD_MAP.items():
             if keyword in part:
-                found_ingredients.add(ingredient)
+                if ingredient not in found:
+                    found.append(ingredient)
                 matched = True
-        if not matched and len(part) > 1:
-            if part not in ['煮付', '炒め', '焼き', '和え', 'ナムル']:
-                found_ingredients.add(part)
-                
-    if not found_ingredients:
-        found_ingredients.add(dish_name)
-        
-    return list(found_ingredients)
+        if not matched:
+            unmatched_log.add((dish_name, part))
 
-# 遍历表格中的每一天
+    # 没有任何匹配 → 统一记为 其他
+    if not found:
+        found.append(OTHER)
+    return found
+
+
+# ========== 3. 解析表格 ==========
+scraped_rows = []
 table = soup.find('table', class_='week_menu_table')
 if table:
-    rows = table.find_all('tr')
-    for tr in rows:
+    for tr in table.find_all('tr'):
         th = tr.find('th')
         td = tr.find('td')
         if not th or not td:
             continue
-            
+
         date_str_raw = th.text.strip()
         date_match = re.search(r'(\d+)月(\d+)日[（\(]([月火水木金土日])[）\)]', date_str_raw)
-        
         if date_match:
             month, day, weekday = date_match.groups()
             formatted_date = f"{current_year}-{int(month):02d}-{int(day):02d}"
@@ -120,85 +146,98 @@ if table:
         dishes = []
         if txt_elem:
             for line in txt_elem.stripped_strings:
-                cleaned_line = line.strip()
-                if cleaned_line:
-                    dishes.append(cleaned_line)
+                line = line.strip()
+                if line:
+                    dishes.append(line)
 
         for dish in dishes:
-            ingredients = extract_ingredients(dish)
-            for ing in ingredients:
+            for ing in extract_ingredients(dish):
                 scraped_rows.append([formatted_date, weekday, dish, ing])
 
-# 2. 连接 Google Sheets
+# 本次去重
+seen = set()
+unique_rows = []
+for r in scraped_rows:
+    key = (r[0], r[2], r[3])
+    if key not in seen:
+        seen.add(key)
+        unique_rows.append(r)
+scraped_rows = unique_rows
+
+if not scraped_rows:
+    raise SystemExit("没有解析到任何菜单数据（页面结构可能变了），本次不修改表格")
+
+print(f"本次解析到 {len(scraped_rows)} 条明细")
+if unmatched_log:
+    print("【未匹配到食材的片段，建议补进 KEYWORD_MAP】")
+    for dish, part in sorted(unmatched_log):
+        print(f"  菜名: {dish}  片段: {part}")
+
+# ========== 4. 连接 Google Sheets ==========
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-creds_dict = json.loads(creds_json)
+creds_dict = json.loads(os.environ.get("GOOGLE_SHEETS_CREDENTIALS"))
 creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
 client = gspread.authorize(creds)
+sheet = client.open_by_key(os.environ.get("SPREADSHEET_ID"))
 
-spreadsheet_id = os.environ.get("SPREADSHEET_ID")
-sheet = client.open_by_key(spreadsheet_id)
+HEADER1 = ["date", "day_of_week", "dish", "ingredient"]
 
-# --- 写入 Sheet 1：每天的食物（增量追加 + 去重） ---
+# ---- Sheet 1：每天的食物（按 (date, dish) 覆盖，保留其他历史） ----
 try:
     sheet1 = sheet.worksheet("每天的食物")
 except gspread.exceptions.WorksheetNotFound:
     sheet1 = sheet.add_worksheet(title="每天的食物", rows="1000", cols="10")
-    sheet1.append_row(["date", "day_of_week", "dish", "ingredient"])
+    sheet1.append_row(HEADER1)
 
-existing_data = sheet1.get_all_values()
-existing_set = set()
-if len(existing_data) > 1:
-    for row in existing_data[1:]:
-        if len(row) >= 4:
-            existing_set.add((row[0], row[2], row[3]))
+existing = sheet1.get_all_values()
+old_rows = [r[:4] + [""] * (4 - len(r[:4])) for r in existing[1:] if any(r)]
 
-new_rows = []
-for row in scraped_rows:
-    row_key = (row[0], row[2], row[3])
-    if row_key not in existing_set:
-        new_rows.append(row)
+# 本次抓到的 (date, dish) 组合：旧行删除，用新行替换
+refresh_keys = {(r[0], r[2]) for r in scraped_rows}
+kept_rows = [r for r in old_rows if (r[0], r[2]) not in refresh_keys]
+removed = len(old_rows) - len(kept_rows)
 
-if new_rows:
-    sheet1.append_rows(new_rows)
-    print(f"成功追加了 {len(new_rows)} 条新数据到 Sheet 1")
-else:
-    print("没有发现需要补充的新数据（已存在）")
+final_rows = kept_rows + scraped_rows
+final_rows.sort(key=lambda r: (r[0], r[2]))
 
-# --- 读取 Sheet 1 的全部历史数据，全量更新统计 Sheet 2 和 Sheet 3 ---
-all_data = sheet1.get_all_records()
-df = pd.DataFrame(all_data)
+sheet1.clear()
+sheet1.update(range_name="A1", values=[HEADER1] + final_rows)
+print(f"Sheet 1：替换旧行 {removed} 条，写入新行 {len(scraped_rows)} 条，当前共 {len(final_rows)} 条")
+
+# ---- 基于全部历史数据更新 Sheet 2 / Sheet 3 ----
+df = pd.DataFrame(final_rows, columns=HEADER1)
 
 if not df.empty:
-    df = df.rename(columns={"日期": "date", "菜品名称": "dish", "食材": "ingredient", "ingredients": "ingredient"})
-    
-    if 'date' in df.columns and 'dish' in df.columns:
-        # Sheet 2：基于全部历史数据统计每种菜品出现的总次数
-        df_dish_unique = df[['date', 'dish']].drop_duplicates()
-        dish_counts = df_dish_unique['dish'].value_counts().reset_index()
-        dish_counts.columns = ['菜品名称', '出现次数']
-        
-        try:
-            sheet2 = sheet.worksheet("菜品出现次数统计")
-        except gspread.exceptions.WorksheetNotFound:
-            sheet2 = sheet.add_worksheet(title="菜品出现次数统计", rows="100", cols="5")
-        
-        sheet2.clear()
-        sheet2_data = [["菜品名称", "出现次数"]] + [[row['菜品名称'], int(row['出现次数'])] for _, row in dish_counts.iterrows()]
-        sheet2.append_rows(sheet2_data)
+    # Sheet 2：每种菜品出现次数（按天去重）
+    df_dish_unique = df[['date', 'dish']].drop_duplicates()
+    dish_counts = df_dish_unique['dish'].value_counts().reset_index()
+    dish_counts.columns = ['菜品名称', '出现次数']
 
-        # Sheet 3：按月分为周期，基于全部历史数据统计每种食材出现的频率
-        df['月份'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
-        ing_freq = df.groupby(['月份', 'ingredient']).size().reset_index(name='出现频率')
-        ing_freq.columns = ['月份', '食材', '出现频率']
-        
-        try:
-            sheet3 = sheet.worksheet("按月食材频率统计")
-        except gspread.exceptions.WorksheetNotFound:
-            sheet3 = sheet.add_worksheet(title="按月食材频率统计", rows="500", cols="5")
-            
-        sheet3.clear()
-        sheet3_data = [["月份", "食材", "出现频率"]] + [[row['月份'], row['食材'], int(row['出现频率'])] for _, row in ing_freq.iterrows()]
-        sheet3.append_rows(sheet3_data)
+    try:
+        sheet2 = sheet.worksheet("菜品出现次数统计")
+    except gspread.exceptions.WorksheetNotFound:
+        sheet2 = sheet.add_worksheet(title="菜品出现次数统计", rows="100", cols="5")
+
+    sheet2.clear()
+    sheet2_data = [["菜品名称", "出现次数"]] + \
+                  [[r['菜品名称'], int(r['出现次数'])] for _, r in dish_counts.iterrows()]
+    sheet2.update(range_name="A1", values=sheet2_data)
+
+    # Sheet 3：按月统计食材频率（同一天同一道菜的同一食材只计一次）
+    df['月份'] = pd.to_datetime(df['date'], errors='coerce').dt.to_period('M').astype(str)
+    df_valid = df[df['月份'] != 'NaT']
+    ing_freq = (df_valid.drop_duplicates(['date', 'dish', 'ingredient'])
+                .groupby(['月份', 'ingredient']).size().reset_index(name='出现频率'))
+    ing_freq.columns = ['月份', '食材', '出现频率']
+
+    try:
+        sheet3 = sheet.worksheet("按月食材频率统计")
+    except gspread.exceptions.WorksheetNotFound:
+        sheet3 = sheet.add_worksheet(title="按月食材频率统计", rows="500", cols="5")
+
+    sheet3.clear()
+    sheet3_data = [["月份", "食材", "出现频率"]] + \
+                  [[r['月份'], r['食材'], int(r['出现频率'])] for _, r in ing_freq.iterrows()]
+    sheet3.update(range_name="A1", values=sheet3_data)
 
 print("历史数据累加与全量统计更新完成！")
