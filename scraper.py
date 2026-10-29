@@ -8,10 +8,19 @@ import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
 
-# 1. 网页抓取与解析
+# 1. 网页抓取与解析（加入 User-Agent 伪装和 15 秒超时控制）
 url = "https://tohan-corp.com/week-menu/"
-response = requests.get(url)
-response.encoding = 'utf-8'
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+try:
+    response = requests.get(url, headers=headers, timeout=15)
+    response.encoding = 'utf-8'
+except requests.exceptions.RequestException as e:
+    print(f"网页请求失败，可能是服务器超时或屏蔽了 IP: {e}")
+    raise e
+
 soup = BeautifulSoup(response.text, 'html.parser')
 
 # 获取年份（从副标题提取，如 "2026年"）
@@ -23,7 +32,6 @@ scraped_rows = []
 
 # 定义更精准的食材提取与拆解函数
 def extract_ingredients(dish_name):
-    # 1. 特殊复合菜名精准映射（直接指定多种核心食材）
     special_map = {
         'カレーコロッケ': ['じゃがいも', 'カレー'],
         '親子丼風煮': ['鶏肉', '卵'],
@@ -33,19 +41,15 @@ def extract_ingredients(dish_name):
         if key in dish_name:
             return ings
 
-    # 2. 包含 "と" 或 "＆" 的多食材菜名自动拆分（如 "チンゲン菜とさつま揚げ"）
     cleaned_name = dish_name
     suffixes = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ', 
                 'のナムル', 'の胡麻和え', 'の金平風', '風煮', '素揚げ', 'プレミアム', 'サラダ', '煮付', '風味']
     for s in suffixes:
         cleaned_name = cleaned_name.replace(s, '')
     
-    # 按 "と" 拆分多重食材
     parts = re.split(r'[と＆]', cleaned_name)
-    
     found_ingredients = set()
     
-    # 3. 基础核心食材词库
     keyword_map = {
         '豚肉': '豚肉',
         'キャベツ': 'キャベツ',
@@ -83,13 +87,10 @@ def extract_ingredients(dish_name):
             if keyword in part:
                 found_ingredients.add(ingredient)
                 matched = True
-        # 如果切出来的一部分不在字典里，但它本身是一个干净的词，也可以视情况添加
         if not matched and len(part) > 1:
-            # 过滤掉纯烹饪修饰词
             if part not in ['煮付', '炒め', '焼き', '和え', 'ナムル']:
                 found_ingredients.add(part)
                 
-    # 如果实在没匹配到，兜底返回原菜名或忽略
     if not found_ingredients:
         found_ingredients.add(dish_name)
         
@@ -186,7 +187,7 @@ if not df.empty:
         sheet2_data = [["菜品名称", "出现次数"]] + [[row['菜品名称'], int(row['出现次数'])] for _, row in dish_counts.iterrows()]
         sheet2.append_rows(sheet2_data)
 
-        # Sheet 3：按月分为周期，基于全部历史数据统计每種食材出现的频率
+        # Sheet 3：按月分为周期，基于全部历史数据统计每种食材出现的频率
         df['月份'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
         ing_freq = df.groupby(['月份', 'ingredient']).size().reset_index(name='出现频率')
         ing_freq.columns = ['月份', '食材', '出现频率']
