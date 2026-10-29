@@ -47,12 +47,14 @@ SPECIAL_MAP = {
     '肉団子の素揚げ': ['豚肉'],
 }
 
+# 调理法/修饰词：先从菜名里去掉，不当作食材
 SUFFIXES = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ',
             'のナムル', 'の胡麻和え', 'の金平風', '風煮', '素揚げ', 'プレミアム',
-            'サラダ', '煮付', '風味']
+            'サラダ', '煮付', '風味', 'とじ']
 
 KEYWORD_MAP = {
     '豚肉': '豚肉',
+    '味噌カツ': '豚肉',
     'キャベツ': 'キャベツ',
     'えび': 'えび',
     '海老': 'えび',
@@ -84,12 +86,21 @@ KEYWORD_MAP = {
     'スパゲティー': 'パスタ・麺類',
     'ペンネ': 'パスタ・麺類',
     'うどん': 'パスタ・麺類',
-    # 新增（来自截图里未匹配的词）
     'トマト': 'トマト',
     '青しそ': '青しそ',
     '隠元': 'いんげん',
     'うす揚げ': 'うす揚げ',
+    # 新增
+    'もやし': 'もやし',
+    '人参': '人参',
+    'にんじん': '人参',
+    'ニンジン': '人参',
+    '枝豆': '枝豆',
+    'コーン': 'コーン',
 }
+
+# 「と」分割时要保护的词（と 后面紧跟这些时，不是"和"的意思）
+SPLIT_REGEX = r'(?:と(?!じ|ろ|んかつ|んカツ|うもろこし)|＆|&)'
 
 unmatched_log = set()
 
@@ -104,7 +115,7 @@ def extract_ingredients(dish_name):
     for s in SUFFIXES:
         cleaned = cleaned.replace(s, '')
 
-    parts = re.split(r'[と＆&]', cleaned)
+    parts = re.split(SPLIT_REGEX, cleaned)
 
     found, unmapped = [], []
     for part in parts:
@@ -187,7 +198,7 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(os.environ.get("SPREADSHEET_ID"))
 
-HEADER1 = ["date", "day_of_week", "dish", "ingredient", "unmapped"]  # [unmapped列]
+HEADER1 = ["date", "day_of_week", "dish", "ingredient", "unmapped"]
 
 # ---- Sheet 1：每天的食物 ----
 try:
@@ -201,7 +212,7 @@ existing = sheet1.get_all_values()
 # 读取旧数据，并把旧格式（一道菜多行）合并为一道菜一行
 merged = {}   # (date, dish) -> [date, weekday, dish, [ingredients], [unmapped]]
 for r in existing[1:]:
-    r = (r + [""] * 5)[:5]          # [unmapped列] 补齐到 5 列
+    r = (r + [""] * 5)[:5]
     if not any(r):
         continue
     key = (r[0], r[2])
@@ -211,7 +222,7 @@ for r in existing[1:]:
         x = x.strip()
         if x and x not in merged[key][3]:
             merged[key][3].append(x)
-    for x in r[4].split(SEP):         # [unmapped列]
+    for x in r[4].split(SEP):
         x = x.strip()
         if x and x not in merged[key][4]:
             merged[key][4].append(x)
@@ -226,8 +237,11 @@ removed = len(old_rows) - len(kept_rows)
 final_rows = kept_rows + scraped_rows
 final_rows.sort(key=lambda r: (r[0], r[2]))
 
-sheet1.clear()
+# 先写入，再清掉尾部多余行（避免中途失败丢数据）
 sheet1.update(range_name="A1", values=[HEADER1] + final_rows)
+n = len(final_rows) + 1                     # 含表头的总行数
+if len(existing) > n:
+    sheet1.batch_clear([f"A{n + 1}:E{len(existing)}"])
 print(f"Sheet 1：替换旧行 {removed} 条，写入新行 {len(scraped_rows)} 条，当前共 {len(final_rows)} 条")
 
 # ---- Sheet 2 / Sheet 3 ----
