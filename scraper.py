@@ -21,8 +21,31 @@ current_year = year_match.group(1) if year_match else str(datetime.now().year)
 
 scraped_rows = []
 
-# 定义严格的食材提取函数（只提取纯食材，过滤掉完整菜名）
+# 定义更精准的食材提取与拆解函数
 def extract_ingredients(dish_name):
+    # 1. 特殊复合菜名精准映射（直接指定多种核心食材）
+    special_map = {
+        'カレーコロッケ': ['じゃがいも', 'カレー'],
+        '親子丼風煮': ['鶏肉', '卵'],
+        '肉団子の素揚げ': ['豚肉'],
+    }
+    for key, ings in special_map.items():
+        if key in dish_name:
+            return ings
+
+    # 2. 包含 "と" 或 "＆" 的多食材菜名自动拆分（如 "チンゲン菜とさつま揚げ"）
+    cleaned_name = dish_name
+    suffixes = ['の煮付', 'の塩だれ焼き', 'の味噌炒め', 'の辛し和え', 'のマヨネーズサラダ', 
+                'のナムル', 'の胡麻和え', 'の金平風', '風煮', '素揚げ', 'プレミアム', 'サラダ', '煮付', '風味']
+    for s in suffixes:
+        cleaned_name = cleaned_name.replace(s, '')
+    
+    # 按 "と" 拆分多重食材
+    parts = re.split(r'[と＆]', cleaned_name)
+    
+    found_ingredients = set()
+    
+    # 3. 基础核心食材词库
     keyword_map = {
         '豚肉': '豚肉',
         'キャベツ': 'キャベツ',
@@ -47,20 +70,29 @@ def extract_ingredients(dish_name):
         '卵': '卵',
         'たこ': 'たこ',
         'ツナ': 'ツナ',
-        'ウインナー': 'ウインナー',
-        'ベーコン': 'ベーコン',
-        'スパゲティー': 'パスタ・麺類',
-        'ペンネ': 'パスタ・麺類',
-        'うどん': 'パスタ・麺類',
+        'レンコン': 'レンコン',
+        'ポテト': 'じゃがいも',
+        'チンゲン菜': 'チンゲン菜',
+        'さつま揚げ': 'さつま揚げ',
     }
-    
-    found_ingredients = set()
-    
-    # 只通过精准的食材字典进行匹配，确保绝不把整道菜名当成食材
-    for keyword, ingredient in keyword_map.items():
-        if keyword in dish_name:
-            found_ingredients.add(ingredient)
-            
+
+    for part in parts:
+        part = part.strip()
+        matched = False
+        for keyword, ingredient in keyword_map.items():
+            if keyword in part:
+                found_ingredients.add(ingredient)
+                matched = True
+        # 如果切出来的一部分不在字典里，但它本身是一个干净的词，也可以视情况添加
+        if not matched and len(part) > 1:
+            # 过滤掉纯烹饪修饰词
+            if part not in ['煮付', '炒め', '焼き', '和え', 'ナムル']:
+                found_ingredients.add(part)
+                
+    # 如果实在没匹配到，兜底返回原菜名或忽略
+    if not found_ingredients:
+        found_ingredients.add(dish_name)
+        
     return list(found_ingredients)
 
 # 遍历表格中的每一天
@@ -93,10 +125,6 @@ if table:
 
         for dish in dishes:
             ingredients = extract_ingredients(dish)
-            # 如果某道菜没有匹配到已知食材，为了保证 Sheet 1 明细完整，可以保留原菜名或记录为空，这里按需处理
-            if not ingredients:
-                ingredients = [dish] # 或者填 "其他"
-                
             for ing in ingredients:
                 scraped_rows.append([formatted_date, weekday, dish, ing])
 
@@ -110,7 +138,7 @@ client = gspread.authorize(creds)
 spreadsheet_id = os.environ.get("SPREADSHEET_ID")
 sheet = client.open_by_key(spreadsheet_id)
 
-# --- 写入 Sheet 1：每天的食物（增量追加 + 智能去重，保留全部历史数据） ---
+# --- 写入 Sheet 1：每天的食物（增量追加 + 去重） ---
 try:
     sheet1 = sheet.worksheet("每天的食物")
 except gspread.exceptions.WorksheetNotFound:
@@ -158,7 +186,7 @@ if not df.empty:
         sheet2_data = [["菜品名称", "出现次数"]] + [[row['菜品名称'], int(row['出现次数'])] for _, row in dish_counts.iterrows()]
         sheet2.append_rows(sheet2_data)
 
-        # Sheet 3：按月分为周期，基于全部历史数据统计每种食材出现的频率
+        # Sheet 3：按月分为周期，基于全部历史数据统计每種食材出现的频率
         df['月份'] = pd.to_datetime(df['date']).dt.to_period('M').astype(str)
         ing_freq = df.groupby(['月份', 'ingredient']).size().reset_index(name='出现频率')
         ing_freq.columns = ['月份', '食材', '出现频率']
